@@ -6,14 +6,18 @@ struct StructureArray
     n_atoms::UInt64
     chain_offsets::Vector{UInt64}
     residue_offsets::Vector{UInt64}
-    data::Dict{String,Vector}
+    data::Dict
+    coord::Matrix{Float64}
 
-    function StructureArray(data::Dict{String,Vector})
+    function StructureArray(data::Dict)
+        coord = Matrix(transpose(hcat(data["Cartn_x"], data["Cartn_y"], data["Cartn_z"])))
+        [pop!(data, key) for key in ["Cartn_x", "Cartn_y", "Cartn_z"]]
         new(
             length(data["auth_asym_id"]),
             find_offsets(data["auth_asym_id"]),
             find_offsets(data["auth_seq_id"]),
-            data
+            data,
+            coord
         )
     end
 end
@@ -167,21 +171,12 @@ Base.length(residue::ResidueArray) = length(residue.start_idx)
 
 function coords(struc::StructureArray)
 
-    return hcat(struc.data["Cartn_x"], struc.data["Cartn_y"], struc.data["Cartn_z"])
+    return struc.coord
 end
 function coords(chain::ChainArray)
-    range = chain.start_idx:chain.end_idx
-    values = Matrix{Float64}(undef, 3, length(range))
-    values[1, :] = chain.struc_array.data["Cartn_x"][range]
-    values[2, :] = chain.struc_array.data["Cartn_y"][range]
-    values[3, :] = chain.struc_array.data["Cartn_z"][range]
-    return values
-    # print("hello")
-    return (chain.struc_array.data["Cartn_x"][range],
-        chain.struc_array.data["Cartn_y"][range],
-        chain.struc_array.data["Cartn_z"][range])
+    return chain.struc_array.coord[:, chain.start_idx:chain.end_idx]
 end
 function coords(residue::ResidueArray)
-    return coords(residue.struc_array)[residue.start_idx:residue.end_idx]
+    return residue.struc_array.coord[:, residue.start_idx:residue.end_idx]
 end
 
