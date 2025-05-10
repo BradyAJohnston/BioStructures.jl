@@ -28,6 +28,7 @@ include("bcif.jl")
 include("download.jl")
 include("spatial.jl")
 include("bonding.jl")
+include("array.jl")
 
 function __init__()
     Base.Experimental.register_error_hint(MethodError) do io, exc, _, _
