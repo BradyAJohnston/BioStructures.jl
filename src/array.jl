@@ -1,6 +1,4 @@
-export StructureArray, ChainArray, ResidueArray, AtomArrray, find_offsets, getvalue
-export chains, residues, resdiues
-export coords
+export StructureArray, ChainArray, ResidueArray, AtomArrray, find_offsets, getvalue, chains, residues, resdiues, resnames, coords, resnameselector
 
 struct StructureArray
     n_atoms::UInt64
@@ -48,7 +46,7 @@ end
 
 Base.show(io::IO, residue::ResidueArray) = print(io, "ResidueArray(", residue.res_id, " in chain ", residue.chain_id, ", ", residue.end_idx - residue.start_idx + 1, " atoms, indices ", residue.start_idx, ":", residue.end_idx, ")")
 
-struct AtomArrray
+struct AtomArray
     struc_array::StructureArray
     idx::UInt64
 
@@ -179,4 +177,26 @@ end
 function coords(residue::ResidueArray)
     return residue.struc_array.coord[:, residue.start_idx:residue.end_idx]
 end
+function coords(atom::AtomArray)
+    return atom.struc_array.coord[:, atom.idx]
+end
 
+
+function resnames(struc::StructureArray)
+    return struc.data["label_comp_id"][struc.residue_offsets]
+end
+function resnames(chain::ChainArray)
+    return chain.struc_array.data["label_comp_id"][chain.residue_offsets]
+end
+
+function resnameselector(el::StructureArray, resnames::String)
+    return resnames(el) .==  resname
+end
+
+function resnameselector(el::StructureArray, resnames::Vector{String})
+    return reduce(+, [resnames(el) .== r for r in resnames])
+end
+
+function chainids(struc::StructureArray)
+    return struc.data["auth_asym_id"][struc.chain_offsets]
+end
