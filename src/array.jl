@@ -1,4 +1,4 @@
-export StructureArray, ChainArray, ResidueArray, AtomArrray, find_offsets, getvalue, chains, residues, resdiues, resnames, coords, resnameselector
+export StructureArray, ChainArray, ResidueArray, AtomArrray, find_offsets, getvalue, chains, residues, resdiues, resnames, coords, resnameselector, coordarray
 
 struct StructureArray
     n_atoms::UInt64
@@ -167,18 +167,18 @@ Base.length(struc::StructureArray) = length(struc.chain_offsets)
 Base.length(chain::ChainArray) = length(chain.start_idx)
 Base.length(residue::ResidueArray) = length(residue.start_idx)
 
-function coords(struc::StructureArray)
+function coordarray(struc::StructureArray)
 
     return struc.coord
 end
-function coords(chain::ChainArray)
-    return chain.struc_array.coord[:, chain.start_idx:chain.end_idx]
+function coordarray(chain::ChainArray)
+    return @views chain.struc_array.coord[:, chain.start_idx:chain.end_idx]
 end
-function coords(residue::ResidueArray)
-    return residue.struc_array.coord[:, residue.start_idx:residue.end_idx]
+function coordarray(residue::ResidueArray)
+    return @views residue.struc_array.coord[:, residue.start_idx:residue.end_idx]
 end
-function coords(atom::AtomArray)
-    return atom.struc_array.coord[:, atom.idx]
+function coordarray(atom::AtomArray)
+    return @views atom.struc_array.coord[:, atom.idx]
 end
 
 
