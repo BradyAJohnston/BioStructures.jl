@@ -1,4 +1,4 @@
-export decode_column, columns_to_dict, datablock_to_dict
+export BCIFDict, BCIFFormat
 using LinearAlgebra
 import MsgPack
 
@@ -8,66 +8,39 @@ import MsgPack
 
 A function to read a binary CIF file from MolStar and extract the list of attributes and their compressed bytes.
 """
-
-# currently isn't implementing the dssp / stride. If using BCIF it seems strange to write
-# out a .pdb, run dssp / string, then read it back in again. 
-function Base.read(input::IO,
-    ::Type{BCIFFormat},
-    structure_name::AbstractString="",
-    remove_disorder::Bool=false,
-    read_std_atoms::Bool=true,
-    read_het_atoms::Bool=true,
-    run_dssp::Bool=false,
-    run_stride::Bool=false)
-
-    file = MsgPack.unpack(read(input))
-    categories = file["dataBlocks"][1]["categories"]
-    atom_site = get_category(categories, "_atom_site")
-    columns = atom_site[1]["columns"]
-    struc = MolecularStructure(structure_name)
-
-    for (i, datablock) in enumerate(file["dataBlocks"])
-        # could decode the whole file at once, or just decode the _atom_site category 
-        # for efficiency which it is currently doing. Can be changed to get access to the 
-        # rest of the file
-
-        decode_all = true
-        if decode_all
-            bcif_dict = BCIFDict(datablock_to_dict(datablock)["_atom_site"])
-        else
-            bcif_dict = BCIFDict(columns_to_dict(get_category(categories, "_atom_site")))
-        end
-
-        struc[i] = Model(i, struc)
-        for i in 1:length(bcif_dict["id"])
-            unsafe_addatomtomodel!(struc[1], AtomRecord(bcif_dict, i))
-        end
+function Base.read(io::IO,
+            ::Type{BCIFFormat};
+            structure_name::AbstractString="",
+            remove_disorder::Bool=false,
+            read_std_atoms::Bool=true,
+            read_het_atoms::Bool=true,
+            run_dssp::Bool=false,
+            run_stride::Bool=false)
+    
+    bcif_dict = MsgPack.unpack(io, BCIFDict)
+    
+    return MolecularStructure(
+        bcif_dict; 
+        structure_name=structure_name,
+        remove_disorder=remove_disorder,
+        read_std_atoms=read_std_atoms,
+        read_het_atoms=read_het_atoms,
+        run_dssp=run_dssp,
+        run_stride=run_stride
+    )
+end
+function Base.read(filename::AbstractString, ::Type{BCIFFormat}; kwargs...)
+    open(filename) do io
+        read(io, BCIFFormat; kwargs...)
     end
-
-    fixlists!(struc)
-    return struc
 end
 
-function datablock_to_dict(datablock::Dict)
-    categories = datablock["categories"]
-    return reduce(merge, [Dict(category["name"] => columns_to_dict(category["columns"])) for category in categories])
-end
-
-function columns_to_dict(columns::Vector{Any})
-    tasks = map(columns) do column
-        Threads.@spawn Dict(column["name"] => decode_column(column))
+struct BCIFDict <: AbstractDict{String, Any}
+    dict::Dict{String,Any}
+    
+    function BCIFDict(dict::Dict{String, Dict{String}})
+        new(convert(Dict{String,Any}, dict))
     end
-    return reduce(merge, fetch.(tasks))
-end
-
-BCIFArrayTypes = Union{Vector{String},Vector{Int32},Vector{Float64}}
-
-struct BCIFDict <: AbstractDict{String,BCIFArrayTypes}
-    dict::Dict{String,BCIFArrayTypes}
-end
-
-function BCIFDict(dict::Dict{String,BCIFArrayTypes})
-    new(dict)
 end
 
 Base.keys(mmcif_dict::BCIFDict) = keys(mmcif_dict.dict)
@@ -78,43 +51,75 @@ Base.length(mmcif_dict::BCIFDict) = length(mmcif_dict.dict)
 Base.iterate(mmcif_dict::BCIFDict) = iterate(mmcif_dict.dict)
 Base.iterate(mmcif_dict::BCIFDict, i) = iterate(mmcif_dict.dict, i)
 
+function MolecularStructure(bcif_dict::BCIFDict; 
+    structure_name::AbstractString="",
+    remove_disorder::Bool=false,
+    read_std_atoms::Bool=true,
+    read_het_atoms::Bool=true,
+    run_dssp::Bool=false,
+    run_stride::Bool=false)
 
-AtomRecord = AtomRecord(d::BCIFDict, i::Int) = AtomRecord(
-    d["group_PDB"][i] == "HETATM",
-    d["id"][i],
-    d["auth_atom_id"][i],
-    d["label_atom_id"][i] == "" ? ' ' : d["label_atom_id"][i][1],
-    d["auth_comp_id"][i],
-    d["auth_asym_id"][i],
-    d["auth_seq_id"][i],
-    d["label_alt_id"][i] == "" ? ' ' : d["label_alt_id"][i][1],
-    [
-        d["Cartn_x"][i],
-        d["Cartn_y"][i],
-        d["Cartn_z"][i]
-    ],
-    d["occupancy"][i],
-    d["B_iso_or_equiv"][i],
-    d["type_symbol"][i],
-    d["pdbx_formal_charge"][i],
-)
+    struc = MolecularStructure(structure_name)
 
-
-function get_category(cats::Vector{Any}, name::String)
-    idx = findall(getindex.(cats, "name") .== name)
-
-    if isnothing(idx)
-        throw(ArgumentError("Category $name not found"))
+    for i in 1:length(bcif_dict["_atom_site"]["id"])
+        model_n = bcif_dict["_atom_site"]["pdbx_PDB_model_num"][i]
+        if !haskey(models(struc), model_n)
+            struc[model_n] = Model(model_n, struc)
+        end
+        unsafe_addatomtomodel!(struc[model_n], AtomRecord(bcif_dict, i))
     end
-    if length(idx) > 1
-        throw(ArgumentError("Multiple categories with name $name found"))
+    fixlists!(struc)
+
+    if run_dssp && run_stride
+        throw(ArgumentError("run_dssp and run_stride cannot both be true"))
+    end
+    if run_dssp
+        rundssp!(struc)
+    end
+    if run_stride
+        runstride!(struc)
     end
 
-    return cats[idx]
+    return struc
 end
 
+function AtomRecord(d::BCIFDict, i::Int) 
+    d = d["_atom_site"]
+    return AtomRecord(
+        d["group_PDB"][i] == "HETATM",
+        d["id"][i],
+        d["auth_atom_id"][i],
+        d["label_alt_id"][i] == "" ? ' ' : d["label_alt_id"][i][1],
+        d["auth_comp_id"][i],
+        string(d["auth_asym_id"][i]),
+        d["auth_seq_id"][i],
+        d["pdbx_PDB_ins_code"][i] == "" ? ' ' : d["pdbx_PDB_ins_code"][i][1],
+        [
+            d["Cartn_x"][i],
+            d["Cartn_y"][i],
+            d["Cartn_z"][i]
+        ],
+        d["occupancy"][i],
+        d["B_iso_or_equiv"][i],
+        d["type_symbol"][i],
+        string(d["pdbx_formal_charge"][i]),
+    )
+end
 
 # Utility functions for encoding/decoding
+
+function MsgPack.from_msgpack(::Type{BCIFDict}, data::Dict{String, Any})
+    categories = data["dataBlocks"][1]["categories"]
+    return BCIFDict(reduce(merge, [Dict(category["name"] => columns_to_dict(category["columns"])) for category in categories]))
+end
+
+function columns_to_dict(columns::Vector{Any})
+    tasks = map(columns) do column
+        Threads.@spawn Dict(column["name"] => decode_column(column))
+    end
+    return reduce(merge, fetch.(tasks))
+end
+
 function encode_stepwise(data, encodings)
     for encoding in encodings
         data = encode(encoding, data)
@@ -145,24 +150,19 @@ function deserialize_numeric_encoding(content::Any)
     end
     params = content
 
-    encoding_constructors = Dict(
-        "ByteArray" => () -> ByteArrayEncoding(INT_TO_TYPE[get(params, "type", nothing)]),
-        "FixedPoint" => () -> FixedPointEncoding(params["factor"]; srcType=INT_TO_TYPE[get(params, "srcType", FLOAT32)]),
-        "IntervalQuantization" => () -> IntervalQuantizationEncoding(params["min"], params["max"], params["numSteps"];
-            srcType=INT_TO_TYPE[get(params, "srcType", 32)]),
-        "RunLength" => () -> RunLengthEncoding(srcSize=get(params, "srcSize", nothing),
-            srcType=INT_TO_TYPE[get(params, "srcType", nothing)]),
-        "Delta" => () -> DeltaEncoding(srcType=INT_TO_TYPE[get(params, "srcType", nothing)],
-            origin=get(params, "origin", 0)),
-        "IntegerPacking" => () -> IntegerPackingEncoding(params["byteCount"],
-            srcSize=get(params, "srcSize", nothing),
-            isUnsigned=get(params, "isUnsigned", false))
-    )
-
-    if haskey(encoding_constructors, kind)
-        return encoding_constructors[kind]()
-    else
-        error("Unknown encoding kind: $kind")
+    if kind == "ByteArray"
+        return ByteArrayEncoding(INT_TO_TYPE[params["type"]])
+    elseif kind == "FixedPoint"
+        return FixedPointEncoding(params["factor"]; srcType=INT_TO_TYPE[params["srcType"]])
+    elseif kind == "IntervalQuantization"
+        return IntervalQuantizationEncoding(params["min"], params["max"], params["numSteps"]; srcType=INT_TO_TYPE[params["srcType"]])
+    elseif kind == "RunLength"
+        return RunLengthEncoding(srcSize=params["srcSize"], srcType=INT_TO_TYPE[params["srcType"]])
+    elseif kind == "Delta"
+        # Pass the actual integer type code, not the Type object
+        return DeltaEncoding(srcType=INT_TO_TYPE[params["srcType"]], origin=Int32(params["origin"]))
+    elseif kind == "IntegerPacking"
+        return IntegerPackingEncoding(params["byteCount"], srcSize=params["srcSize"], isUnsigned=params["isUnsigned"])
     end
 end
 
@@ -193,19 +193,8 @@ end
 # Below are the encoding and decoding types for BCIF format
 
 # Data types defined for the BCIF encoding by are indicated by integer values
-# there are not well discussed in the official spec, had to ask about it excplicitly
+# there are not well discussed in the official spec, had to ask about it explicitly
 # https://github.com/molstar/BinaryCIF/issues/4
-@enum TypeCode begin
-    INT8 = 1
-    INT16 = 2
-    INT32 = 3
-    UINT8 = 4
-    UINT16 = 5
-    UINT32 = 6
-    FLOAT32 = 32
-    FLOAT64 = 33
-end
-
 const INT_TO_TYPE = Dict(
     1 => Int8,
     2 => Int16,
@@ -217,77 +206,66 @@ const INT_TO_TYPE = Dict(
     33 => Float64
 )
 
-# Mapping from TypeCode to Julia types
-const TYPE_CODE_TO_TYPE = Dict(
-    INT8 => Int8,
-    INT16 => Int16,
-    INT32 => Int32,
-    UINT8 => UInt8,
-    UINT16 => UInt16,
-    UINT32 => UInt32,
-    FLOAT32 => Float32,
-    FLOAT64 => Float64
-)
+const TYPES_TO_INT = IdDict{Any, Int}(t => i for (i, t) in INT_TO_TYPE)
+
+const EncodingDataTypes = Union{values(INT_TO_TYPE)...}
 
 # Mapping from Julia types to TypeCode
-const TYPE_TO_TYPE_CODE = Dict(value => key for (key, value) in TYPE_CODE_TO_TYPE)
 
 # Safe casting function
-function safe_cast(array, dtype)
-    if eltype(array) == dtype
-        return array
-    end
+# function safe_cast(array, dtype)
+#     if eltype(array) == dtype
+#         return array
+#     end
 
-    if dtype <: Integer && !(eltype(array) <: Integer)
-        throw(ArgumentError("Cannot cast floating point to integer"))
-    end
+#     if dtype <: Integer && !(eltype(array) <: Integer)
+#         throw(ArgumentError("Cannot cast floating point to integer"))
+#     end
 
-    if dtype <: Integer
-        type_min, type_max = typemin(dtype), typemax(dtype)
-        if any(x -> x < type_min || x > type_max, array)
-            throw(ArgumentError("Integer values do not fit into the given dtype"))
-        end
-    end
+#     if dtype <: Integer
+#         type_min, type_max = typemin(dtype), typemax(dtype)
+#         if any(x -> x < type_min || x > type_max, array)
+#             throw(ArgumentError("Integer values do not fit into the given dtype"))
+#         end
+#     end
 
-    return convert(Array{dtype}, array)
-end
+#     return convert(Array{dtype}, array)
+# end
 
 # Abstract encoding type
 abstract type Encoding end
 
 # ByteArrayEncoding
-mutable struct ByteArrayEncoding <: Encoding
-    type::Union{TypeCode,Nothing}
+struct ByteArrayEncoding <: Encoding
+    type::DataType
+end
 
-    function ByteArrayEncoding(type=nothing)
-        if type !== nothing
-            type = type isa TypeCode ? type : TYPE_TO_TYPE_CODE[type]
-        end
-        new(type)
+# Add a constructor that handles the type lookup from INT_TO_TYPE
+function ByteArrayEncoding(type_code::Integer)
+    if haskey(INT_TO_TYPE, type_code)
+        return ByteArrayEncoding(INT_TO_TYPE[type_code])
+    else
+        throw(ArgumentError("Invalid type code: $type_code"))
     end
 end
 
-function encode(enc::ByteArrayEncoding, data)
-    if enc.type === nothing
-        enc.type = TYPE_TO_TYPE_CODE[eltype(data)]
-    end
-    return reinterpret(UInt8, safe_cast(data, TYPE_CODE_TO_TYPE[enc.type]))
-end
+# function encode(enc::ByteArrayEncoding, data)
+#     if enc.type === nothing
+#         enc.type = TYPE_TO_TYPE_CODE[eltype(data)]
+#     end
+#     return reinterpret(UInt8, safe_cast(data, TYPE_CODE_TO_TYPE[enc.type]))
+# end
 
 function decode(enc::ByteArrayEncoding, data)
-    return reinterpret(TYPE_CODE_TO_TYPE[enc.type], data)
+    return reinterpret(enc.type, data)
 end
 
 # FixedPointEncoding
-mutable struct FixedPointEncoding <: Encoding
+struct FixedPointEncoding <: Encoding
     factor::Float64
-    srcType::TypeCode
+    srcType::DataType
 
-    function FixedPointEncoding(factor; srcType=FLOAT32)
-        srcType = srcType isa TypeCode ? srcType : TYPE_TO_TYPE_CODE[srcType]
-        if !(srcType in (FLOAT32, FLOAT64))
-            throw(ArgumentError("Only floating point types are supported"))
-        end
+    function FixedPointEncoding(factor; srcType::DataType)
         new(factor, srcType)
     end
 end
@@ -297,88 +275,80 @@ function encode(enc::FixedPointEncoding, data)
 end
 
 function decode(enc::FixedPointEncoding, data)
-    return convert(Array{TYPE_CODE_TO_TYPE[enc.srcType]}, data ./ enc.factor)
+    return convert(Array{enc.srcType}, data ./ enc.factor)
 end
 
 # IntervalQuantizationEncoding
-mutable struct IntervalQuantizationEncoding <: Encoding
+struct IntervalQuantizationEncoding <: Encoding
     min::Float64
     max::Float64
     numSteps::Int
-    srcType::TypeCode
-
-    function IntervalQuantizationEncoding(min, max, numSteps; srcType=FLOAT32)
-        srcType = srcType isa TypeCode ? srcType : TYPE_TO_TYPE_CODE[srcType]
-        new(min, max, numSteps, srcType)
-    end
+    srcType::DataType
 end
 
-function encode(enc::IntervalQuantizationEncoding, data)
-    # Convert to normalized values between 0 and numSteps-1
-    normalized = (data .- enc.min) ./ (enc.max - enc.min) .* (enc.numSteps - 1)
-    # Clamp to valid range and convert to integers
-    indices = clamp.(round.(Int32, normalized), 0, enc.numSteps - 1)
-    return indices
-end
+# function encode(enc::IntervalQuantizationEncoding, data)
+#     # Convert to normalized values between 0 and numSteps-1
+#     normalized = (data .- enc.min) ./ (enc.max - enc.min) .* (enc.numSteps - 1)
+#     # Clamp to valid range and convert to integers
+#     indices = clamp.(round.(Int32, normalized), 0, enc.numSteps - 1)
+#     return indices
+# end
 
 function decode(enc::IntervalQuantizationEncoding, data)
     # Convert indices back to values in the original range
     normalized = data ./ Float64(enc.numSteps - 1)
     output = normalized .* (enc.max - enc.min) .+ enc.min
-    return convert(Array{TYPE_CODE_TO_TYPE[enc.srcType]}, output)
+    return convert(Array{enc.srcType}, output)
 end
 
 # RunLengthEncoding
-mutable struct RunLengthEncoding <: Encoding
-    srcSize::Union{Int,Nothing}
-    srcType::Union{TypeCode,Nothing}
+struct RunLengthEncoding <: Encoding
+    srcSize::Int
+    srcType::DataType
 
-    function RunLengthEncoding(; srcSize=nothing, srcType=nothing)
-        if srcType !== nothing
-            srcType = srcType isa TypeCode ? srcType : TYPE_TO_TYPE_CODE[srcType]
-        end
+    function RunLengthEncoding(; srcSize, srcType)
         new(srcSize, srcType)
     end
 end
 
-function encode(enc::RunLengthEncoding, data)
-    if enc.srcType === nothing
-        enc.srcType = TYPE_TO_TYPE_CODE[eltype(data)]
-    end
-    if enc.srcSize === nothing
-        enc.srcSize = length(data)
-    elseif enc.srcSize != length(data)
-        throw(ArgumentError("Given source size does not match actual data size"))
-    end
+# function encode(enc::RunLengthEncoding, data)
+#     if enc.srcType === nothing
+#         enc.srcType = TYPE_TO_TYPE_CODE[eltype(data)]
+#     end
+#     if enc.srcSize === nothing
+#         enc.srcSize = length(data)
+#     elseif enc.srcSize != length(data)
+#         throw(ArgumentError("Given source size does not match actual data size"))
+#     end
 
-    # Pessimistic allocation - worst case is run length of 1 for every element
-    output = zeros(Int32, length(data) * 2)
-    j = 1
-    val = data[1]
-    run_length = 0
+#     # Pessimistic allocation - worst case is run length of 1 for every element
+#     output = zeros(Int32, length(data) * 2)
+#     j = 1
+#     val = data[1]
+#     run_length = 0
 
-    for i in 1:length(data)
-        curr_val = data[i]
-        if curr_val == val
-            run_length += 1
-        else
-            # New element -> Write element with run-length
-            output[j] = val
-            output[j+1] = run_length
-            j += 2
-            val = curr_val
-            run_length = 1
-        end
-    end
+#     for i in 1:length(data)
+#         curr_val = data[i]
+#         if curr_val == val
+#             run_length += 1
+#         else
+#             # New element -> Write element with run-length
+#             output[j] = val
+#             output[j+1] = run_length
+#             j += 2
+#             val = curr_val
+#             run_length = 1
+#         end
+#     end
 
-    # Write last element
-    output[j] = val
-    output[j+1] = run_length
-    j += 2
+#     # Write last element
+#     output[j] = val
+#     output[j+1] = run_length
+#     j += 2
 
-    # Trim to correct size
-    return output[1:j-1]
-end
+#     # Trim to correct size
+#     return output[1:j-1]
+# end
 
 function decode(enc::RunLengthEncoding, data)
     if length(data) % 2 != 0
@@ -395,7 +365,7 @@ function decode(enc::RunLengthEncoding, data)
         length_output = enc.srcSize
     end
 
-    output = zeros(TYPE_CODE_TO_TYPE[enc.srcType], length_output)
+    output = zeros(enc.srcType, length_output)
     j = 1
 
     for i in 1:2:length(data)
@@ -409,42 +379,30 @@ function decode(enc::RunLengthEncoding, data)
 end
 
 # DeltaEncoding
-mutable struct DeltaEncoding <: Encoding
-    srcType::Union{TypeCode,Nothing}
-    origin::Int
+struct DeltaEncoding <: Encoding
+    srcType::DataType
+    origin::Int32
 
-    function DeltaEncoding(; srcType=nothing, origin=0)
-        if srcType !== nothing
-            srcType = srcType isa TypeCode ? srcType : TYPE_TO_TYPE_CODE[srcType]
-        end
+    # Constructor for Type parameter
+    function DeltaEncoding(; srcType::Type, origin::Int32=0)
         new(srcType, origin)
     end
 end
 
-function encode(enc::DeltaEncoding, data)
-    if enc.srcType === nothing
-        enc.srcType = TYPE_TO_TYPE_CODE[eltype(data)]
-    end
-
-    data = data .- enc.origin
-    diffs = vcat([0], diff(data))
-    return convert(Array{Int32}, diffs)
-end
-
 function decode(enc::DeltaEncoding, data)
     output = cumsum(data)
-    output = convert(Array{TYPE_CODE_TO_TYPE[enc.srcType]}, output)
+    output = convert(Array{enc.srcType}, output)
     output .+= enc.origin
     return output
 end
 
 # IntegerPackingEncoding
-mutable struct IntegerPackingEncoding <: Encoding
+struct IntegerPackingEncoding <: Encoding
     byteCount::Int
-    srcSize::Union{Int,Nothing}
+    srcSize::Int
     isUnsigned::Bool
 
-    function IntegerPackingEncoding(byteCount; srcSize=nothing, isUnsigned=false)
+    function IntegerPackingEncoding(byteCount; srcSize, isUnsigned=false)
         new(byteCount, srcSize, isUnsigned)
     end
 end
@@ -459,63 +417,63 @@ function determine_packed_dtype(enc::IntegerPackingEncoding)
     end
 end
 
-function encode(enc::IntegerPackingEncoding, data)
-    if enc.srcSize === nothing
-        enc.srcSize = length(data)
-    elseif enc.srcSize != length(data)
-        throw(ArgumentError("Given source size does not match actual data size"))
-    end
+# function encode(enc::IntegerPackingEncoding, data)
+#     if enc.srcSize === nothing
+#         enc.srcSize = length(data)
+#     elseif enc.srcSize != length(data)
+#         throw(ArgumentError("Given source size does not match actual data size"))
+#     end
 
-    data = convert(Array{Int32}, data)
-    packed_type = determine_packed_dtype(enc)
-    min_val = typemin(packed_type)
-    max_val = typemax(packed_type)
+#     data = convert(Array{Int32}, data)
+#     packed_type = determine_packed_dtype(enc)
+#     min_val = typemin(packed_type)
+#     max_val = typemax(packed_type)
 
-    # Get length of output array by summing up required length of each element
-    length_output = 0
-    for num in data
-        if num < 0
-            if min_val == 0
-                throw(ArgumentError("Cannot pack negative numbers into unsigned type"))
-            end
-            # Required packed length is number of times min_val needs to be repeated + 1
-            length_output += div(num, min_val) + 1
-        elseif num > 0
-            length_output += div(num, max_val) + 1
-        else
-            # num = 0
-            length_output += 1
-        end
-    end
+#     # Get length of output array by summing up required length of each element
+#     length_output = 0
+#     for num in data
+#         if num < 0
+#             if min_val == 0
+#                 throw(ArgumentError("Cannot pack negative numbers into unsigned type"))
+#             end
+#             # Required packed length is number of times min_val needs to be repeated + 1
+#             length_output += div(num, min_val) + 1
+#         elseif num > 0
+#             length_output += div(num, max_val) + 1
+#         else
+#             # num = 0
+#             length_output += 1
+#         end
+#     end
 
-    # Fill output
-    output = zeros(packed_type, length_output)
-    j = 1
+#     # Fill output
+#     output = zeros(packed_type, length_output)
+#     j = 1
 
-    for i in 1:length(data)
-        remainder = data[i]
-        if remainder < 0
-            if min_val == 0
-                throw(ArgumentError("Cannot pack negative numbers into unsigned type"))
-            end
-            while remainder <= min_val
-                remainder -= min_val
-                output[j] = min_val
-                j += 1
-            end
-        elseif remainder > 0
-            while remainder >= max_val
-                remainder -= max_val
-                output[j] = max_val
-                j += 1
-            end
-        end
-        output[j] = remainder
-        j += 1
-    end
+#     for i in 1:length(data)
+#         remainder = data[i]
+#         if remainder < 0
+#             if min_val == 0
+#                 throw(ArgumentError("Cannot pack negative numbers into unsigned type"))
+#             end
+#             while remainder <= min_val
+#                 remainder -= min_val
+#                 output[j] = min_val
+#                 j += 1
+#             end
+#         elseif remainder > 0
+#             while remainder >= max_val
+#                 remainder -= max_val
+#                 output[j] = max_val
+#                 j += 1
+#             end
+#         end
+#         output[j] = remainder
+#         j += 1
+#     end
 
-    return output
-end
+#     return output
+# end
 
 function decode(enc::IntegerPackingEncoding, data)
     packed_type = determine_packed_dtype(enc)
@@ -548,7 +506,7 @@ function decode(enc::IntegerPackingEncoding, data)
 end
 
 # StringArrayEncoding
-mutable struct StringArrayEncoding <: Encoding
+struct StringArrayEncoding <: Encoding
     stringData::String
     dataEncoding::Vector{Encoding}
     offsetEncoding::Vector{Encoding}
@@ -556,53 +514,53 @@ mutable struct StringArrayEncoding <: Encoding
 
     function StringArrayEncoding(; stringData=nothing, dataEncoding=nothing, offsetEncoding=nothing, offsets=nothing)
         if dataEncoding === nothing
-            dataEncoding = [ByteArrayEncoding(INT32)]
+            dataEncoding = [ByteArrayEncoding(Int32)]
         end
         if offsetEncoding === nothing
-            offsetEncoding = [ByteArrayEncoding(INT32)]
+            offsetEncoding = [ByteArrayEncoding(Int32)]
         end
         new(stringData, dataEncoding, offsetEncoding, offsets)
     end
 end
 
-function encode(enc::StringArrayEncoding, data)
-    if !(eltype(data) <: AbstractString)
-        throw(ArgumentError("Data must be of string type"))
-    end
+# function encode(enc::StringArrayEncoding, data)
+#     if !(eltype(data) <: AbstractString)
+#         throw(ArgumentError("Data must be of string type"))
+#     end
 
-    if enc.stringData === nothing
-        # Get unique stringData
-        enc.stringData = unique(data)
-        check_present = false
-    else
-        check_present = true
-    end
+#     if enc.stringData === nothing
+#         # Get unique stringData
+#         enc.stringData = unique(data)
+#         check_present = false
+#     else
+#         check_present = true
+#     end
 
-    # Sort stringData for binary search
-    sorted_indices = sortperm(enc.stringData)
-    sorted_strings = enc.stringData[sorted_indices]
+#     # Sort stringData for binary search
+#     sorted_indices = sortperm(enc.stringData)
+#     sorted_strings = enc.stringData[sorted_indices]
 
-    # Find indices of each string in data
-    indices = zeros(Int32, length(data))
-    for i in 1:length(data)
-        idx = searchsortedfirst(sorted_strings, data[i])
-        if idx <= length(sorted_strings) && sorted_strings[idx] == data[i]
-            indices[i] = sorted_indices[idx]
-        else
-            if check_present
-                throw(ArgumentError("Data contains stringData not present in 'stringData'"))
-            end
-        end
-    end
+#     # Find indices of each string in data
+#     indices = zeros(Int32, length(data))
+#     for i in 1:length(data)
+#         idx = searchsortedfirst(sorted_strings, data[i])
+#         if idx <= length(sorted_strings) && sorted_strings[idx] == data[i]
+#             indices[i] = sorted_indices[idx]
+#         else
+#             if check_present
+#                 throw(ArgumentError("Data contains stringData not present in 'stringData'"))
+#             end
+#         end
+#     end
 
-    # Apply encodings
-    encoded_data = indices
-    for encoding in enc.dataEncoding
-        encoded_data = encode(encoding, encoded_data)
-    end
+#     # Apply encodings
+#     encoded_data = indices
+#     for encoding in enc.dataEncoding
+#         encoded_data = encode(encoding, encoded_data)
+#     end
 
-    return encoded_data
-end
+#     return encoded_data
+# end
 
 function decode(enc::StringArrayEncoding, data)
     # Apply decodings in reverse order
